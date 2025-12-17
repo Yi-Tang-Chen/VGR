@@ -20,6 +20,7 @@ Compared to standard CoT, DCoLT is distinguished with several notable features:
 
 ## News
 
+- ```[Sep 2025]``` LLaDOU has been accepted by NeurIPS 2025. Congrats!
 - ```[July 2025]``` [Training code](https://github.com/maple-research-lab/LLaDOU?tab=readme-ov-file#training) is provided!
 - ```[May 2025]``` Released [LLaDOU v0 Math](https://huggingface.co/maple-research-lab/LLaDOU-v0-Math) and [LLaDOU v0 Code](https://huggingface.co/maple-research-lab/LLaDOU-v0-Code) models, their evaluation code and [technique report](https://arxiv.org/abs/2505.10446).
 
@@ -82,10 +83,10 @@ Prepare datasets as following:
 ## Citation
 If this repository helps with your work, please consider giving a star and citation:
 ```
-@article{huang2025reinforcing,
+@inproceedings{huang2025reinforcing,
   title={Reinforcing the Diffusion Chain of Lateral Thought with Diffusion Language Models},
   author={Zemin Huang and Zhiyang Chen and Zijun Wang and Tiancheng Li and Guo-Jun Qi},
-  journal={arXiv preprint arXiv:2505.10446},
+  journal={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
   year={2025}
 }
 ```
