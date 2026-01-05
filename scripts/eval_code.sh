@@ -1,4 +1,4 @@
-export PROC_PER_NODES=8
+export PROC_PER_NODES=1
 
 torchrun \
     --standalone \

@@ -15,17 +15,13 @@ def collate_fn_math(batch,):
     }
 
 
-def collate_fn_gsm8k(batch,):
-    problems = []
-    answers = []
+def collate_fn_gsm8k(batch):
+    problems, answers = [], []
+    instruct = "\nPlease give the final answer in the format: #### <number>.\n"
     for item in batch:
-        problems.append(item['question'])
-        answers.append(item['answer'])
-    
-    return {
-        "problems": problems, 
-        "answers": answers
-    }
+        problems.append(item["question"] + instruct)
+        answers.append(item["answer"])
+    return {"problems": problems, "answers": answers}
 
 
 def extract_answer_gsm8k(answer: str):
