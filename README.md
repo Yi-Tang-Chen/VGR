@@ -1,92 +1,85 @@
-<div align="center">
+# Value-Gated Remasking (VGR) Phase A
 
-<h1>Large Language Diffusion with Ordered Unmasking (LLaDOU)</h1>
-<p align="center">
-<a href="https://arxiv.org/abs/2505.10446"><img src="https://img.shields.io/badge/arXiv-2505.10446-b31b1b.svg" alt="ArXiv"></a>
-<a href="https://huggingface.co/maple-research-lab/LLaDOU-v0-Math"><img src="https://img.shields.io/badge/Huggingface-LLaDOU v0 Math-yellow" alt="Checkpoint"></a>
-<a href="https://huggingface.co/maple-research-lab/LLaDOU-v0-Code"><img src="https://img.shields.io/badge/Huggingface-LLaDOU v0 Code-yellow" alt="Checkpoint"></a>
-</p>
+Phase A only trains a value critic with outcome reward and keeps the actor frozen. At inference, VGR uses the critic to trigger local remasking and resampling, enabling self-correction without RL finetuning.
 
-</div>
+## Goals
+- Freeze actor parameters (no RL updates).
+- Train a critic $V_\phi(x_t, t, c)$ from outcome-only rewards.
+- Use value-gated remasking to improve GSM8K/MATH accuracy and reduce error types.
 
-We introduce the **L**arge **La**nguage **D**iffusion with **O**rdered **U**nmasking (**LLaDOU**), which is trained by reinforcing a new reasoning paradigm named the **D**iffusion **C**hain **o**f **L**ateral **T**hought (**DCoLT**) for diffusion language models.
+## Data and Reward
+- Training data: GSM8K train (7,473) + MATH train (7,500), total ~15K prompts.
+- Evaluation data: GSM8K test (1,319) + MATH test (5,000).
+- Reward: $R(x_0, c) = \mathbb{1}(\text{final answer correct})$.
 
-Compared to standard CoT, DCoLT is distinguished with several notable features:
-- **Bidirectional Reasoning**: Allowing global refinement throughout generations with bidirectional self-attention masks.
-- **Format-Free Reasoning**: No strict rule on grammatical correctness amid its intermediate steps of thought.
-- **Nonlinear Generation**: Generating tokens at various positions in different steps.
+## Phase A Workflow
 
-![Demonstration of DCoLT](assets/dcolt.png)
+### Stage A: Offline Feature Collection (one-time rollout)
+Run the frozen actor once to collect a compact dataset for critic training.
 
-## News
+What gets saved:
+- `features`: pooled last hidden state of the generated region (dimension 4096).
+- `timesteps`: diffusion step ratio $t \in [0,1]$.
+- `rewards`: outcome reward $R \in \{0,1\}$.
+- Optional extra features: mask/fill ratios and block position.
 
-- ```[Sep 2025]``` LLaDOU has been accepted by NeurIPS 2025. Congrats!
-- ```[July 2025]``` [Training code](https://github.com/maple-research-lab/LLaDOU?tab=readme-ov-file#training) is provided!
-- ```[May 2025]``` Released [LLaDOU v0 Math](https://huggingface.co/maple-research-lab/LLaDOU-v0-Math) and [LLaDOU v0 Code](https://huggingface.co/maple-research-lab/LLaDOU-v0-Code) models, their evaluation code and [technique report](https://arxiv.org/abs/2505.10446).
-
-## Getting Started
-
-### Inference
-
-```python
-import torch
-from transformers import AutoTokenizer
-from networks.lladou_v0 import LLaDOUModelLM, sample
-
-tokenizer = AutoTokenizer.from_pretrained("models/LLaDOU-v0-Math")
-model = LLaDOUModelLM.from_pretrained(
-    pretrained_model_name_or_path="models/LLaDOU-v0-Math",
-    trust_remote_code=True,
-    torch_dtype=torch.bfloat16,
-    device_map="cuda",
-)
-
-problem = "What is the answer of 1+1?"
-outputs = sample(
-    model,
-    problem,
-    tokenizer,
-    device="cuda",
-)
-response = outputs["responses"][0]
-print(response)
-```
-
-### Training
-We provide an example to train LLaDOU on GSM8K dataset, feel free to change the configuration file!
-
+Command:
 ```bash
-accelerate launch --num_processes 8 --config_file configs/accelerate/fsdp.yaml train.py --config configs/gsm8k_64step_example.yaml
+bash scripts/collect_critic_features.sh
 ```
 
-### Evaluation
+Output:
+- `datasets_cache/critic_train.pt` containing `features`, `timesteps`, `rewards`, `task_ids`, and `meta`.
 
-Prepare datasets as following:
-```
-├── datasets
-│   ├── gsm8k
-│   │   └── ...
-│   ├── MATH
-│   │   └── ...
-│   ├── mbpp.jsonl
-│   ├── mbpp_test.jsonl
-│   └── HumanEval.jsonl.gz
+### Stage B: Offline Critic Training (no actor calls)
+Train a small MLP value head on the cached dataset. This stage is fast and does not run diffusion.
+
+Command:
+```bash
+bash scripts/train_critic.sh
 ```
 
-- For GSM8K and MATH evaluation, please run [scripts/eval_math.sh](scripts/eval_math.sh).
-- For MBPP and HumanEval evaluation, please run [scripts/eval_code.sh](scripts/eval_code.sh).
+Output:
+- Critic head checkpoints under `runs/critic/...` (e.g., `critic_head_epoch1.pt`).
 
-<div align="center"><strong>Evaluation Metrics</strong></div>
+## VGR Inference
+VGR uses the critic to gate remasking during diffusion sampling.
 
-![Evaluation Metrics](assets/metrics_v0.png)
+Gate rule (v1):
+- Trigger remask when value is non-improving: $V_{t} \le V_{t-1}$.
 
-## Citation
-If this repository helps with your work, please consider giving a star and citation:
+Remask action:
+- Select top-$k$ least confident tokens from newly updated positions.
+- Remask them and resample to allow correction.
+
+Command:
+```bash
+bash scripts/eval_math_vgr.sh
 ```
-@inproceedings{huang2025reinforcing,
-  title={Reinforcing the Diffusion Chain of Lateral Thought with Diffusion Language Models},
-  author={Zemin Huang and Zhiyang Chen and Zijun Wang and Tiancheng Li and Guo-Jun Qi},
-  journal={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
-  year={2025}
-}
-```
+
+## Default Hyperparameters (v1)
+
+Sampling:
+- steps: 256
+- gen_length: 256
+- block_length: 8
+- temperature: 1.0
+
+VGR:
+- gate_start_step: 32
+- retry_m: 8
+- max_backtracks_total: 32
+
+Critic:
+- pooled hidden size: 4096
+- steps sampled per trajectory: $K=2$ (Stage A default)
+- loss: BCE
+
+## Files and Entry Points
+- `training/collect_critic_features.py`: offline feature collector.
+- `training/train_critic.py`: offline critic trainer.
+- `networks/value_critic.py`: critic head model.
+- `networks/vgr_sampler.py`: VGR sampling logic.
+- `scripts/collect_critic_features.sh`: Stage A runner.
+- `scripts/train_critic.sh`: Stage B runner.
+- `scripts/eval_math_vgr.sh`: evaluation with VGR.

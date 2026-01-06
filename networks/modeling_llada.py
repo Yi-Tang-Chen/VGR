@@ -960,6 +960,11 @@ class LLaDAOutput(NamedTuple):
     Hidden states from each block.
     """
 
+    last_hidden_state: Optional[torch.Tensor]
+    """
+    Final hidden state after the last layer norm.
+    """
+
 
 class LLaDAGenerateOutput(NamedTuple):
     token_ids: torch.LongTensor
@@ -1181,6 +1186,7 @@ class LLaDAModel(nn.Module):
         use_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
+        return_last_hidden_state: Optional[bool] = None,
         position_ids = None,
     ) -> LLaDAOutput:
         """
@@ -1219,6 +1225,9 @@ class LLaDAModel(nn.Module):
         assert (past_key_values is None and not use_cache), "The kvcache is not suppotred for MDM."
 
         output_hidden_states = output_hidden_states if output_hidden_states is not None else False
+        return_last_hidden_state = return_last_hidden_state if return_last_hidden_state is not None else False
+        if return_last_hidden_state:
+            output_hidden_states = False
 
         if past_key_values:
             assert len(past_key_values) == self.config.n_layers
@@ -1295,12 +1304,12 @@ class LLaDAModel(nn.Module):
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
 
         # decoder layers
-        all_hidden_states = []
+        all_hidden_states = [] if output_hidden_states else None
 
         # Apply blocks one-by-one.
         if self.config.block_group_size == 1:
             for block_idx, block in enumerate(self.transformer.blocks):
-                if output_hidden_states:
+                if all_hidden_states is not None:
                     # add hidden states
                     all_hidden_states.append(x)
 
@@ -1332,7 +1341,7 @@ class LLaDAModel(nn.Module):
                     attn_key_values.append(cache)
         else:
             for group_idx, block_group in enumerate(self.transformer.block_groups):
-                if output_hidden_states:
+                if all_hidden_states is not None:
                     # add hidden states
                     all_hidden_states.append(x)
 
@@ -1358,7 +1367,7 @@ class LLaDAModel(nn.Module):
         # shape: (batch_size, seq_len or 1, d_model)
         x = self.transformer.ln_f(x)  # type: ignore
 
-        if output_hidden_states:
+        if all_hidden_states is not None:
             # add final hidden state post-final-layernorm, following HuggingFace's convention
             all_hidden_states.append(x)
 
@@ -1373,7 +1382,14 @@ class LLaDAModel(nn.Module):
 
         
 
-        return LLaDAOutput(logits=logits, attn_key_values=attn_key_values, hidden_states=tuple(all_hidden_states) if output_hidden_states else None)  # type: ignore[arg-type]
+        last_hidden_state = x if return_last_hidden_state else None
+
+        return LLaDAOutput(
+            logits=logits,
+            attn_key_values=attn_key_values,
+            hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
+            last_hidden_state=last_hidden_state,
+        )  # type: ignore[arg-type]
 
 
 def create_model_config_from_pretrained_config(config: LLaDAConfig):
@@ -1420,6 +1436,7 @@ class LLaDAModelLM(PreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        return_last_hidden_state: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         position_ids: Optional[bool] = None,
         cache_position: Optional[Cache] = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
@@ -1441,25 +1458,34 @@ class LLaDAModelLM(PreTrainedModel):
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
+            return_last_hidden_state=return_last_hidden_state,
             position_ids = position_ids,
         )
 
         logits = outputs.logits
         hidden_states = outputs.hidden_states
+        last_hidden_state = outputs.last_hidden_state
+        if hidden_states is None and return_last_hidden_state:
+            hidden_states = (last_hidden_state,)
 
         loss = None
         if labels is not None:
             import warnings
             warnings.warn("Note that for LLaDA, you cannot calculate the loss here.", UserWarning)
         if not return_dict:
-            output = (logits,) + outputs[1:]
+            output = (logits, outputs.attn_key_values, hidden_states)
+            if return_last_hidden_state:
+                output = output + (last_hidden_state,)
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
+        out = CausalLMOutputWithPast(
             logits=logits,
             past_key_values=outputs.attn_key_values,
             hidden_states=hidden_states,
         )
+        if return_last_hidden_state:
+            setattr(out, "last_hidden_state", last_hidden_state)
+        return out
 
     def can_generate(self) -> bool:
         return True

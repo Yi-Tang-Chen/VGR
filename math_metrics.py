@@ -1,4 +1,6 @@
-import os, json
+import os
+import json
+import glob
 import click 
 import numpy as np
 from tqdm import tqdm
@@ -9,6 +11,8 @@ from transformers import AutoTokenizer
 from datasets import load_dataset
 
 from networks.lladou_v0 import LLaDOUModelLM, sample
+from networks.value_critic import ValueCritic
+from networks.vgr_sampler import vgr_sample
 from dataloaders.collate_fn_math import collate_fn_math, extract_answer_gsm8k, collate_fn_gsm8k
 from evaluate.grader import math_equal
 from evaluate.parser import extract_answer
@@ -49,6 +53,11 @@ def judge_answer_GSM8K(answers: Sequence[str], responses: Sequence[str], counts)
 @click.option('--task', type=str, default="gsm8k")
 @click.option('--seed', type=int, default=113)
 @click.option('--no_sample', type=bool, default=True)
+@click.option('--critic_path', type=str, default="")
+@click.option('--gate_start_step', type=int, default=32)
+@click.option('--retry_m', type=int, default=8)
+@click.option('--max_backtracks_total', type=int, default=32)
+@click.option('--min_value_improve', type=float, default=0.0)
 def main(
     ckpt_path, 
     local_data_path, 
@@ -59,6 +68,11 @@ def main(
     block_length, 
     no_sample,
     seed,
+    critic_path,
+    gate_start_step,
+    retry_m,
+    max_backtracks_total,
+    min_value_improve,
     **kwargs,
 ):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -76,6 +90,20 @@ def main(
         torch_dtype=torch.bfloat16,
     )
     model.eval().requires_grad_(False).to(device)
+
+    critic = None
+    if critic_path:
+        resolved_path = critic_path
+        if os.path.isdir(critic_path):
+            candidates = sorted(glob.glob(os.path.join(critic_path, "critic_head*.pt")))
+            if not candidates:
+                raise FileNotFoundError(f"No critic_head*.pt found in {critic_path}")
+            resolved_path = candidates[-1]
+        critic_state = torch.load(resolved_path, map_location="cpu")
+        state_dict = critic_state.get("state_dict", critic_state)
+        critic = ValueCritic(model)
+        critic.load_head_state_dict(state_dict)
+        critic.eval().to(device)
     
     # load data 
     if 'MATH' in local_data_path:
@@ -100,20 +128,38 @@ def main(
     
     pbar = tqdm(dl)
     counts = [0, 0] 
+    total_backtracks = 0
 
     for ix, batch in enumerate(pbar):
         answers = batch['answers']
-
-        inputs = sample(
-            model,
-            batch,
-            tokenizer,
-            device=device,
-            inference=no_sample,
-            steps=steps,
-            gen_length=gen_length,
-            block_length=block_length,
-        )
+        if critic is None:
+            inputs = sample(
+                model,
+                batch,
+                tokenizer,
+                device=device,
+                inference=no_sample,
+                steps=steps,
+                gen_length=gen_length,
+                block_length=block_length,
+            )
+        else:
+            inputs = vgr_sample(
+                model,
+                critic,
+                batch,
+                tokenizer,
+                device=device,
+                inference=no_sample,
+                steps=steps,
+                gen_length=gen_length,
+                block_length=block_length,
+                gate_start_step=gate_start_step,
+                retry_m=retry_m,
+                max_backtracks_total=max_backtracks_total,
+                min_value_improve=min_value_improve,
+            )
+            total_backtracks += inputs["backtrack_counts"].sum().item()
         
         responses = tokenizer.batch_decode(inputs['trajectory_outputs'][-1], skip_special_tokens=True)
         
@@ -132,6 +178,9 @@ def main(
     print("Final Counts:", counts)
     if counts[1] > 0:
         print(f"Final Acc: {counts[0]/counts[1]:.4f}")
+        if critic is not None:
+            avg_backtracks = total_backtracks / counts[1]
+            print(f"Avg Backtracks: {avg_backtracks:.2f}")
 
 if __name__ == "__main__":
     main()

@@ -12,10 +12,20 @@ def sample_categorical(categorical_probs, method="hard"):
     if method == "hard":
         gumbel_norm = 1e-10 - (torch.rand_like(categorical_probs) + 1e-10).log()
         return (categorical_probs / gumbel_norm).argmax(dim=-1)
-    elif method == 'max':
+    elif method == "max":
         return categorical_probs.argmax(dim=-1)
     else:
         raise ValueError(f"Method {method} for sampling categorical variables is not valid.")
+
+
+def sample_categorical_logits(logits, method="hard"):
+    if method == "hard":
+        u = torch.rand_like(logits).clamp_(min=1e-10, max=1 - 1e-10)
+        gumbel = -torch.log(-torch.log(u))
+        return (logits + gumbel).argmax(dim=-1)
+    if method == "max":
+        return logits.argmax(dim=-1)
+    raise ValueError(f"Method {method} for sampling categorical variables is not valid.")
 
 class LLaDOUModelLM(LLaDAModelLM):
     def __init__(self, *args, **kwargs):
@@ -104,8 +114,25 @@ class LLaDOUModelLM(LLaDAModelLM):
             return super().forward(*args, **kwargs)
 
 @torch.no_grad()
-def sample(model, batch, tokenizer, device, reward_fn=None, num_generations=1, repeat_times=1, temperature=1., steps=256,
-    gen_length=256, block_length=8, mask_id=126336, eos_id=126081, inference=False):
+def sample(
+    model,
+    batch,
+    tokenizer,
+    device,
+    reward_fn=None,
+    num_generations=1,
+    repeat_times=1,
+    temperature=1.0,
+    steps=256,
+    gen_length=256,
+    block_length=8,
+    mask_id=126336,
+    eos_id=126081,
+    inference=False,
+    record_pooled_hidden_steps=None,
+    pooled_hidden_pool="mean",
+    record_trajectory=True,
+):
     '''
     Args:
         model: Mask predictor.
@@ -123,8 +150,8 @@ def sample(model, batch, tokenizer, device, reward_fn=None, num_generations=1, r
         block_length = gen_length
     assert gen_length % block_length == 0
     steps_per_block = steps * block_length // gen_length
+    num_blocks = gen_length // block_length
 
-    prob_dtype = torch.float64
     problems = batch['problems']
     m = [[{"role": "user", "content": prompt}] for prompt in problems]
     prompts = tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False)
@@ -148,29 +175,35 @@ def sample(model, batch, tokenizer, device, reward_fn=None, num_generations=1, r
     x = x.repeat(num_generations, 1)
     prompt_len = prompt_len.repeat(num_generations)
 
-    trajectory_inputs = []
-    trajectory_outputs = []
-    update_flags = []
-    current_blocks = []
-    sample_orders = []
+    trajectory_inputs = [] if record_trajectory else []
+    trajectory_outputs = [] if record_trajectory else []
+    update_flags = [] if record_trajectory else []
+    current_blocks = [] if record_trajectory else []
+    sample_orders = [] if record_trajectory else []
+    pooled_hidden_states = []
+    pooled_hidden_steps = []
+    pooled_extra_features = []
     batch_size = x.shape[0]
 
     current_block = torch.zeros((x.shape[0], gen_length), device=x.device,  dtype=torch.bool)
     current_block[:, :block_length] = True
+    if record_pooled_hidden_steps is not None and torch.is_tensor(record_pooled_hidden_steps):
+        record_pooled_hidden_steps = record_pooled_hidden_steps.tolist()
+    record_steps = set(record_pooled_hidden_steps) if record_pooled_hidden_steps is not None else None
     for step in range(steps):
         # record model inputs
-        trajectory_inputs.append(x.clone())
-        current_blocks.append(current_block)
+        if record_trajectory:
+            trajectory_inputs.append(x.clone())
+            current_blocks.append(current_block)
         
         mask_index = (x == mask_id)
         with torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16):
-            outputs = model(x, output_hidden_states=True, attention_mask=attention_mask)
-        merge_hidden_states = outputs.hidden_states[-1] # + outputs.hidden_states[0]
+            outputs = model(x, return_last_hidden_state=True, attention_mask=attention_mask)
+        merge_hidden_states = outputs.last_hidden_state
         last_hidden_states = torch.stack([f[prompt_len[i]: prompt_len[i] + gen_length] for i, f in enumerate(merge_hidden_states)])
 
         logits = outputs.logits / temperature if temperature > 0. else outputs.logits
-        p = F.softmax(logits.to(prob_dtype), dim=-1)
-        pred_out = sample_categorical(p, 'hard' if not inference else 'max')
+        pred_out = sample_categorical_logits(logits, 'hard' if not inference else 'max')
         pred_out = torch.where(mask_index, pred_out, x)
 
         timestep = torch.full(
@@ -180,10 +213,48 @@ def sample(model, batch, tokenizer, device, reward_fn=None, num_generations=1, r
         )
 
         mask_index = torch.stack([im[prompt_len[i]: prompt_len[i] + gen_length] for i, im in enumerate(mask_index)])
-        remask_logits = model(last_hidden_states, pred_mask_prob=True, timestep=timestep, mask_index=mask_index, current_block=current_block)
+        if record_steps is not None and step in record_steps:
+            pooled = []
+            for i in range(merge_hidden_states.shape[0]):
+                start = int(prompt_len[i])
+                end = start + gen_length
+                token_states = merge_hidden_states[i, start:end]
+                if pooled_hidden_pool == "mean":
+                    pooled.append(token_states.mean(dim=0))
+                elif pooled_hidden_pool == "last":
+                    pooled.append(token_states[-1])
+                else:
+                    raise ValueError(f"Unknown pooled_hidden_pool: {pooled_hidden_pool}")
+            pooled_hidden_states.append(torch.stack(pooled, dim=0))
+            pooled_hidden_steps.append(step)
+
+            block_len = current_block.float().sum(dim=1).clamp(min=1.0)
+            mask_frac = (mask_index & current_block).float().sum(dim=1) / block_len
+            filled_frac = ((~mask_index) & current_block).float().sum(dim=1) / block_len
+            block_id = (step // steps_per_block) % max(num_blocks, 1)
+            block_id_norm = float(block_id) / float(max(num_blocks - 1, 1))
+            block_step_frac = float(step % steps_per_block) / float(max(steps_per_block - 1, 1))
+            extra_dtype = mask_frac.dtype
+            block_id_t = torch.full((batch_size,), block_id_norm, device=mask_frac.device, dtype=extra_dtype)
+            block_step_t = torch.full((batch_size,), block_step_frac, device=mask_frac.device, dtype=extra_dtype)
+            pooled_extra_features.append(torch.stack([mask_frac, filled_frac, block_id_t, block_step_t], dim=-1))
+        remask_logits = model(
+            last_hidden_states,
+            pred_mask_prob=True,
+            timestep=timestep,
+            mask_index=mask_index,
+            current_block=current_block,
+        )
         remask_logits = remask_logits.masked_fill(~mask_index, -torch.inf)
         remask_logits = remask_logits.masked_fill(~current_block, -torch.inf)
         remask_prob = remask_logits.softmax(-1)
+        remask_prob = torch.nan_to_num(remask_prob, nan=0.0, posinf=0.0, neginf=0.0)
+        remask_prob = remask_prob.clamp(min=0)
+        row_sum = remask_prob.sum(dim=-1, keepdim=True)
+        if (row_sum == 0).any():
+            fallback = current_block.float()
+            fallback = fallback / fallback.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            remask_prob = torch.where(row_sum == 0, fallback, remask_prob)
 
         if inference:
             samples = remask_prob.topk(gen_length // steps).indices
@@ -194,7 +265,8 @@ def sample(model, batch, tokenizer, device, reward_fn=None, num_generations=1, r
         update_flag[bs_idx, samples] = True
         update_index = torch.zeros_like(x).bool()
         update_index[bs_idx, prompt_len.unsqueeze(1) + samples] = True
-        sample_orders.append(samples)
+        if record_trajectory:
+            sample_orders.append(samples)
 
         x0 = torch.where(update_index, pred_out, x)
 
@@ -202,8 +274,9 @@ def sample(model, batch, tokenizer, device, reward_fn=None, num_generations=1, r
             current_block = current_block.roll(block_length, 1)
 
         # record model outputs
-        trajectory_outputs.append(x0.clone())
-        update_flags.append(update_flag)
+        if record_trajectory:
+            trajectory_outputs.append(x0.clone())
+            update_flags.append(update_flag)
         x = x0
 
     responses = tokenizer.batch_decode(x0, skip_special_tokens=True)
@@ -218,6 +291,9 @@ def sample(model, batch, tokenizer, device, reward_fn=None, num_generations=1, r
         'rewards': rewards,
         'sample_orders': sample_orders,
         'attention_mask': attention_mask,
+        'pooled_hidden_states': pooled_hidden_states if record_steps is not None else None,
+        'pooled_hidden_steps': pooled_hidden_steps if record_steps is not None else None,
+        'pooled_extra_features': pooled_extra_features if record_steps is not None else None,
     }
     
     return output_dict
@@ -263,10 +339,10 @@ def logprob_loss(model, inputs, valid_samples, eps = .2, beta= 0.0, gain=1.0, te
 
         mask_index = torch.stack([im[prompt_len[i]: prompt_len[i] + gen_length] for i, im in enumerate(mask_index)])
         with torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16):
-            outputs = model(x, output_hidden_states=True, attention_mask=attention_mask)
+            outputs = model(x, return_last_hidden_state=True, attention_mask=attention_mask)
             logits = outputs.logits / temperature if temperature > 0. else outputs.logits
 
-            merge_hidden_states = outputs.hidden_states[-1]
+            merge_hidden_states = outputs.last_hidden_state
             last_hidden_states = torch.stack([f[prompt_len[i]: prompt_len[i] + gen_length] for i, f in enumerate(merge_hidden_states)])
             remask_logits = model(last_hidden_states, pred_mask_prob=True, timestep=timestep, mask_index=mask_index, current_block=current_block)
 
