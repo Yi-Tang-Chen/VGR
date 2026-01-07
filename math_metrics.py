@@ -42,6 +42,24 @@ def judge_answer_GSM8K(answers: Sequence[str], responses: Sequence[str], counts)
     return counts
 
 
+def reward_from_responses_gsm8k(answers: Sequence[str], responses: Sequence[str]):
+    ext_ans = [extract_answer_gsm8k(ans) for ans in answers]
+    ext_res = [extract_answer(res) for res in responses]
+    rewards = []
+    for ans, res in zip(ext_ans, ext_res):
+        rewards.append(1.0 if math_equal(ans, res) else 0.0)
+    return rewards
+
+
+def reward_from_responses_math(answers: Sequence[str], responses: Sequence[str]):
+    ext_ans = [extract_answer(ans) for ans in answers]
+    ext_res = [extract_answer(res) for res in responses]
+    rewards = []
+    for ans, res in zip(ext_ans, ext_res):
+        rewards.append(1.0 if math_equal(ans, res, timeout=True) else 0.0)
+    return rewards
+
+
 @click.command()
 @click.option("--ckpt_path", type=str, default="")
 @click.option('--local_data_path', type=str, default="datasets/gsm8k")
@@ -170,7 +188,6 @@ def main(
 
         total_correct = counts[0]
         total_samples = counts[1]
-        
         if total_samples > 0:
             acc = total_correct / total_samples
             pbar.set_description(f"acc: {acc * 100:.2f}%")

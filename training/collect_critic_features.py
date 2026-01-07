@@ -15,7 +15,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 from transformers import AutoTokenizer
 
 from dataloaders.collate_fn_math import collate_fn_math, collate_fn_gsm8k
-from dataloaders.math import reward_MATH, reward_gsm8k
+from math_metrics import reward_from_responses_gsm8k, reward_from_responses_math
 from networks.lladou_v0 import LLaDOUModelLM, sample
 
 
@@ -61,12 +61,14 @@ def build_dataloader(
 
 def outcome_reward(task: str, batch, responses, num_generations, device):
     if task == "gsm8k":
-        rewards = reward_gsm8k(batch, responses, num_generations, device)
-    elif task == "math":
-        rewards = reward_MATH(batch, responses, num_generations, device)
-    else:
-        raise ValueError(f"Unknown task: {task}")
-    return (rewards > 0).float()
+        answers = batch["answers"] * num_generations
+        rewards = reward_from_responses_gsm8k(answers, responses)
+        return torch.tensor(rewards, device=device, dtype=torch.float32)
+    if task == "math":
+        answers = batch["answers"] * num_generations
+        rewards = reward_from_responses_math(answers, responses)
+        return torch.tensor(rewards, device=device, dtype=torch.float32)
+    raise ValueError(f"Unknown task: {task}")
 
 
 @click.command()
@@ -164,11 +166,8 @@ def main(
                 step_indices = [steps // 2]
             else:
                 step_indices = rng.sample(range(steps), k=min(k_steps, steps))
-            with torch.inference_mode(), torch.autocast(
-                device_type=("cuda" if device == "cuda" else "cpu"),
-                enabled=(device == "cuda"),
-                dtype=actor_dtype,
-            ):
+            # Keep sampling ops in fp32; sample() already autocasts model forward.
+            with torch.inference_mode():
                 sample_outputs = sample(
                     actor,
                     batch,

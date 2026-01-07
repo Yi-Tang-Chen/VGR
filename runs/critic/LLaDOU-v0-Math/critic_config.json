@@ -1,0 +1,37 @@
+{
+  "dataset_path": "datasets_cache/critic_train.pt",
+  "epochs": 5,
+  "batch_size": 512,
+  "loss_type": "bce",
+  "lr": 0.0002,
+  "weight_decay": 0.01,
+  "mlp_hidden_mult": 1.0,
+  "dropout": 0.1,
+  "seed": 113,
+  "hidden_size": 4100,
+  "use_timestep": true,
+  "pool": "mean",
+  "meta": {
+    "hidden_size": 4100,
+    "pool": "mean",
+    "use_timestep": true,
+    "extra_feature_names": [
+      "mask_frac",
+      "filled_frac",
+      "block_id_norm",
+      "block_step_frac"
+    ],
+    "steps": 128,
+    "gen_length": 256,
+    "block_length": 8,
+    "k_steps": 2,
+    "num_generations": 1,
+    "temperature": 1.0,
+    "actor_inference": true,
+    "tasks": [
+      "gsm8k",
+      "math"
+    ],
+    "seed": 113
+  }
+}

@@ -23,7 +23,7 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def load_feature_dataset(path: str) -> Dict:
+def load_feature_dataset(path: str) -> dict:
     data = torch.load(path, map_location="cpu")
     for key in ("features", "timesteps", "rewards"):
         if key not in data:
