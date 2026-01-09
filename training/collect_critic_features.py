@@ -4,17 +4,61 @@ import random
 import time
 from typing import List
 
+_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_candidate_env = [
+    os.environ.get("TMPDIR"),
+    os.environ.get("TEMP"),
+    os.environ.get("TMP"),
+]
+_candidates = [c for c in _candidate_env if c]
+_candidates += [
+    "/dev/shm",
+    "/tmp",
+    "/var/tmp",
+    "/usr/tmp",
+    os.path.join(_repo_root, ".tmp"),
+]
+_tmpdir = None
+for _path in _candidates:
+    if not _path:
+        continue
+    try:
+        os.makedirs(_path, exist_ok=True)
+        _probe = os.path.join(_path, f".lladou_tmp_test_{os.getpid()}")
+        with open(_probe, "w", encoding="utf-8") as _handle:
+            _handle.write("1")
+        try:
+            os.remove(_probe)
+        except OSError:
+            pass
+        _tmpdir = os.path.abspath(_path)
+        break
+    except OSError:
+        continue
+if _tmpdir is None:
+    raise RuntimeError(
+        "No usable temporary directory. Set TMPDIR to a path with free space."
+    )
+os.environ.setdefault("TMPDIR", _tmpdir)
+os.environ.setdefault("TEMP", _tmpdir)
+os.environ.setdefault("TMP", _tmpdir)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import click
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
 from transformers import AutoTokenizer
 
-from dataloaders.collate_fn_math import collate_fn_math, collate_fn_gsm8k
+from dataloaders.collate_fn_math import (
+    collate_fn_math,
+    collate_fn_gsm8k,
+    extract_answer_gsm8k,
+)
+from evaluate.grader import math_equal
+from evaluate.parser import extract_answer
 from math_metrics import reward_from_responses_gsm8k, reward_from_responses_math
 from networks.lladou_v0 import LLaDOUModelLM, sample
 
@@ -71,14 +115,28 @@ def outcome_reward(task: str, batch, responses, num_generations, device):
     raise ValueError(f"Unknown task: {task}")
 
 
+def decode_generations(tokenizer, gen_ids, eos_id, include_raw=False):
+    gen_ids = gen_ids.detach().cpu()
+    decoded = []
+    decoded_raw = [] if include_raw else None
+    for row in gen_ids:
+        ids = row.tolist()
+        if eos_id is not None and eos_id in ids:
+            ids = ids[: ids.index(eos_id)]
+        decoded.append(tokenizer.decode(ids, skip_special_tokens=True))
+        if decoded_raw is not None:
+            decoded_raw.append(tokenizer.decode(ids, skip_special_tokens=False))
+    return decoded, decoded_raw
+
+
 @click.command()
 @click.option("--actor_ckpt_path", type=str, required=True)
 @click.option("--output_path", type=str, default="datasets_cache/critic_train.pt")
 @click.option("--gsm8k_path", type=str, default="datasets/gsm8k")
 @click.option("--math_path", type=str, default="datasets/MATH")
 @click.option("--tasks", type=str, default="gsm8k,math")
-@click.option("--batch_size", type=int, default=1)
-@click.option("--num_workers", type=int, default=2)
+@click.option("--batch_size", type=int, default=2)
+@click.option("--num_workers", type=int, default=4)
 @click.option("--steps", type=int, default=256)
 @click.option("--gen_length", type=int, default=256)
 @click.option("--block_length", type=int, default=8)
@@ -90,6 +148,10 @@ def outcome_reward(task: str, batch, responses, num_generations, device):
 @click.option("--max_rows", type=int, default=0)
 @click.option("--seed", type=int, default=113)
 @click.option("--log_every", type=int, default=50)
+@click.option("--debug_samples", type=int, default=0)
+@click.option("--debug_path", type=str, default="datasets_cache/critic_debug.jsonl")
+@click.option("--ban_eos", type=bool, default=False)
+@click.option("--align_to_max_prompt", type=bool, default=False)
 def main(
     actor_ckpt_path,
     output_path,
@@ -109,6 +171,10 @@ def main(
     max_rows,
     seed,
     log_every,
+    debug_samples,
+    debug_path,
+    ban_eos,
+    align_to_max_prompt,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     set_seed(seed)
@@ -122,6 +188,8 @@ def main(
     tokenizer = AutoTokenizer.from_pretrained(actor_ckpt_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = 126081
+    if align_to_max_prompt:
+        tokenizer.padding_side = "left"
 
     actor_dtype = torch.bfloat16 if device == "cuda" else torch.float32
     actor = LLaDOUModelLM.from_pretrained(
@@ -158,6 +226,8 @@ def main(
     total_prompts = 0
     total_rows = 0
     start_time = time.perf_counter()
+    debug_records = []
+    debug_written = 0
 
     for task_idx, (task, dl) in enumerate(dataloaders.items()):
         for batch in dl:
@@ -173,7 +243,7 @@ def main(
                     batch,
                     tokenizer,
                     device=device,
-                    reward_fn=lambda b, r, n, d: outcome_reward(task, b, r, n, d),
+                    reward_fn=None,
                     num_generations=num_generations,
                     repeat_times=1,
                     temperature=temperature,
@@ -184,10 +254,76 @@ def main(
                     record_pooled_hidden_steps=step_indices,
                     pooled_hidden_pool=pool,
                     record_trajectory=False,
+                    record_final_output=True,
+                    ban_eos=ban_eos,
+                    align_to_max_prompt=align_to_max_prompt,
                 )
 
-            rewards = sample_outputs["rewards"]
+            final_output = sample_outputs.get("final_output")
+            if final_output is None:
+                raise RuntimeError("sample() did not return final_output. Update networks/lladou_v0.py.")
+            prompt_seq_len = sample_outputs["attention_mask"].shape[1] - gen_length
+            gen_ids = final_output[:, prompt_seq_len : prompt_seq_len + gen_length]
+            gen_texts, gen_texts_raw = decode_generations(
+                tokenizer, gen_ids, tokenizer.eos_token_id, include_raw=(debug_samples > 0)
+            )
+            responses_full = None
+            if debug_samples > 0:
+                responses_full = tokenizer.batch_decode(final_output, skip_special_tokens=True)
+
+            answers = batch["answers"] * num_generations
+            if task == "gsm8k":
+                rewards = torch.tensor(
+                    reward_from_responses_gsm8k(answers, gen_texts), dtype=torch.float32
+                )
+            else:
+                rewards = torch.tensor(
+                    reward_from_responses_math(answers, gen_texts), dtype=torch.float32
+                )
             batch_rows = rewards.numel()
+            if debug_samples > 0 and debug_written < debug_samples:
+                problems = batch["problems"] * num_generations
+                for i, (prob, ans, resp, gen_resp, gen_resp_raw) in enumerate(
+                    zip(problems, answers, responses_full, gen_texts, gen_texts_raw)
+                ):
+                    if debug_written >= debug_samples:
+                        break
+                    prompt_len = int(sample_outputs["prompt_len"][i].item())
+                    eos_id = tokenizer.eos_token_id
+                    mask_id = getattr(tokenizer, "mask_token_id", None)
+                    if mask_id is None:
+                        mask_id = getattr(actor.config, "mask_token_id", None)
+                    eos_frac = (
+                        (gen_ids[i] == eos_id).float().mean().item() if eos_id is not None else 0.0
+                    )
+                    mask_frac = (
+                        (gen_ids[i] == mask_id).float().mean().item() if mask_id is not None else 0.0
+                    )
+                    if task == "gsm8k":
+                        ext_ans = extract_answer_gsm8k(ans)
+                        ext_res = extract_answer(gen_resp)
+                        reward_dbg = 1.0 if math_equal(ext_ans, ext_res) else 0.0
+                    else:
+                        ext_ans = extract_answer(ans)
+                        ext_res = extract_answer(gen_resp)
+                        reward_dbg = 1.0 if math_equal(ext_ans, ext_res, timeout=True) else 0.0
+                    debug_records.append(
+                        {
+                            "task": task,
+                            "problem": prob,
+                            "answer": ans,
+                            "response": resp,
+                            "gen_response": gen_resp,
+                            "gen_response_raw": gen_resp_raw,
+                            "gen_eos_frac": eos_frac,
+                            "gen_mask_frac": mask_frac,
+                            "prompt_len": prompt_len,
+                            "ext_answer": ext_ans,
+                            "ext_response": ext_res,
+                            "reward": reward_dbg,
+                        }
+                    )
+                    debug_written += 1
             pooled_states = sample_outputs.get("pooled_hidden_states")
             pooled_steps = sample_outputs.get("pooled_hidden_steps")
             pooled_extras = sample_outputs.get("pooled_extra_features")
@@ -209,7 +345,15 @@ def main(
                 task_ids_list.append(torch.full((batch_rows,), task_idx, dtype=torch.int8))
                 total_rows += batch_rows
 
-            del sample_outputs, pooled_states, pooled_steps, pooled_extras, rewards
+            del (
+                sample_outputs,
+                pooled_states,
+                pooled_steps,
+                pooled_extras,
+                rewards,
+                final_output,
+                gen_ids,
+            )
             if device == "cuda":
                 torch.cuda.empty_cache()
 
@@ -258,6 +402,12 @@ def main(
     torch.save(data, output_path)
     print(f"Saved features to {output_path}")
     print(f"Total prompts: {total_prompts} | Total rows: {total_rows} | Hidden size: {hidden_size}")
+    if debug_records:
+        os.makedirs(os.path.dirname(debug_path) or ".", exist_ok=True)
+        with open(debug_path, "w", encoding="utf-8") as handle:
+            for item in debug_records:
+                handle.write(json.dumps(item, ensure_ascii=True) + "\n")
+        print(f"Saved debug samples to {debug_path}")
 
 
 if __name__ == "__main__":

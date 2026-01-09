@@ -132,6 +132,9 @@ def sample(
     record_pooled_hidden_steps=None,
     pooled_hidden_pool="mean",
     record_trajectory=True,
+    record_final_output=False,
+    ban_eos=False,
+    align_to_max_prompt=False,
 ):
     '''
     Args:
@@ -159,18 +162,28 @@ def sample(
     prompt = inputs['input_ids'].to(device)
     attention_mask = inputs['attention_mask'].to(device)
     prompt_len = attention_mask.sum(dim=1)
+    prompt_seq_len = prompt.shape[1]
+    use_max_prompt = align_to_max_prompt or (prompt_len != prompt_seq_len).any().item()
 
-    attention_mask = torch.cat([
-        torch.ones((len(problems), gen_length), device=attention_mask.device, dtype=attention_mask.dtype),
-        attention_mask,
-    ], dim=1)
+    attention_mask = torch.cat(
+        [
+            attention_mask,
+            torch.ones(
+                (len(problems), gen_length),
+                device=attention_mask.device,
+                dtype=attention_mask.dtype,
+            ),
+        ],
+        dim=1,
+    )
     attention_mask = attention_mask.repeat(num_generations, 1)
 
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(device)
     x[:, :prompt.shape[1]] = prompt.clone()
     # set eos_id to the last position of the generated answer
-    for i in range(x.shape[0]):
-        x[i, prompt_len[i] + gen_length:] = eos_id
+    if not use_max_prompt:
+        for i in range(x.shape[0]):
+            x[i, prompt_len[i] + gen_length:] = eos_id
 
     x = x.repeat(num_generations, 1)
     prompt_len = prompt_len.repeat(num_generations)
@@ -200,9 +213,18 @@ def sample(
         with torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16):
             outputs = model(x, return_last_hidden_state=True, attention_mask=attention_mask)
         merge_hidden_states = outputs.last_hidden_state
-        last_hidden_states = torch.stack([f[prompt_len[i]: prompt_len[i] + gen_length] for i, f in enumerate(merge_hidden_states)])
+        if use_max_prompt:
+            last_hidden_states = merge_hidden_states[:, prompt_seq_len: prompt_seq_len + gen_length]
+        else:
+            last_hidden_states = torch.stack(
+                [f[prompt_len[i] : prompt_len[i] + gen_length] for i, f in enumerate(merge_hidden_states)]
+            )
 
         logits = outputs.logits / temperature if temperature > 0. else outputs.logits
+        if ban_eos and eos_id is not None:
+            logits = logits.float()
+            eos_id_int = int(eos_id)
+            logits[mask_index, eos_id_int] = -torch.inf
         pred_out = sample_categorical_logits(logits, 'hard' if not inference else 'max')
         pred_out = torch.where(mask_index, pred_out, x)
 
@@ -212,11 +234,16 @@ def sample(
             device=last_hidden_states.device
         )
 
-        mask_index = torch.stack([im[prompt_len[i]: prompt_len[i] + gen_length] for i, im in enumerate(mask_index)])
+        if use_max_prompt:
+            mask_index = mask_index[:, prompt_seq_len : prompt_seq_len + gen_length]
+        else:
+            mask_index = torch.stack(
+                [im[prompt_len[i] : prompt_len[i] + gen_length] for i, im in enumerate(mask_index)]
+            )
         if record_steps is not None and step in record_steps:
             pooled = []
             for i in range(merge_hidden_states.shape[0]):
-                start = int(prompt_len[i])
+                start = prompt_seq_len if use_max_prompt else int(prompt_len[i])
                 end = start + gen_length
                 token_states = merge_hidden_states[i, start:end]
                 if pooled_hidden_pool == "mean":
@@ -264,7 +291,10 @@ def sample(
         update_flag = torch.zeros_like(remask_logits).bool()
         update_flag[bs_idx, samples] = True
         update_index = torch.zeros_like(x).bool()
-        update_index[bs_idx, prompt_len.unsqueeze(1) + samples] = True
+        if use_max_prompt:
+            update_index[bs_idx, prompt_seq_len + samples] = True
+        else:
+            update_index[bs_idx, prompt_len.unsqueeze(1) + samples] = True
         if record_trajectory:
             sample_orders.append(samples)
 
@@ -295,6 +325,8 @@ def sample(
         'pooled_hidden_steps': pooled_hidden_steps if record_steps is not None else None,
         'pooled_extra_features': pooled_extra_features if record_steps is not None else None,
     }
+    if record_final_output:
+        output_dict["final_output"] = x0.clone()
     
     return output_dict
 

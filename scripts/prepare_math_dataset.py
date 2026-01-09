@@ -2,6 +2,18 @@ import os, json
 from datasets import load_dataset
 from tqdm import tqdm
 
+import os, json
+from datasets import load_dataset
+
+os.makedirs("datasets/gsm8k", exist_ok=True)
+ds = load_dataset("openai/gsm8k", "main")  # GSM8K :contentReference[oaicite:4]{index=4}
+for split in ["train", "test"]:
+    out = f"datasets/gsm8k/{split}.jsonl"
+    with open(out, "w", encoding="utf-8") as f:
+        for ex in ds[split]:
+            f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+print("Saved GSM8K to datasets/gsm8k/{train,test}.jsonl")
+
 # EleutherAI 的 MATH 鏡像（可用，且有 train/test）
 DATASET_NAME = "EleutherAI/hendrycks_math"
 SUBJECTS = [
